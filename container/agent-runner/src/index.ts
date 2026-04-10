@@ -547,10 +547,13 @@ async function runQuery(
   };
   setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
 
-  // Load global CLAUDE.md as additional system context (shared across all groups)
+  // Load global CLAUDE.md as additional system context (shared across all groups,
+  // including main — without the claude_code preset below, the SDK won't auto-load
+  // any CLAUDE.md from cwd, so this is the only way persona instructions reach
+  // the agent in the main group)
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
   let globalClaudeMd: string | undefined;
-  if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
+  if (fs.existsSync(globalClaudeMdPath)) {
     globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
   }
 
@@ -581,13 +584,14 @@ async function runQuery(
       // user message at HARD_CAP_TURNS (and resets per-message), which
       // gives correct UX. Adding maxTurns here would silently break the
       // per-message reset because it's per-query()-call cumulative.
-      systemPrompt: globalClaudeMd
-        ? {
-            type: 'preset' as const,
-            preset: 'claude_code' as const,
-            append: globalClaudeMd,
-          }
-        : undefined,
+      // Always use the claude_code preset so the SDK auto-loads CLAUDE.md from
+      // cwd (/workspace/group/CLAUDE.md = groups/<group>/CLAUDE.md). Append the
+      // global doc if present so all groups share it.
+      systemPrompt: {
+        type: 'preset' as const,
+        preset: 'claude_code' as const,
+        ...(globalClaudeMd ? { append: globalClaudeMd } : {}),
+      },
       allowedTools: [
         'Bash',
         'Read',
