@@ -21,6 +21,7 @@ import {
   query,
   HookCallback,
   PreCompactHookInput,
+  PreToolUseHookInput,
 } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 
@@ -63,6 +64,19 @@ interface SDKUserMessage {
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
+
+// Per-USER-MESSAGE budget caps. Each new user message piped into the stream
+// resets startTime + turnCounter back to zero, so a chatty conversation never
+// inherits the previous turn's budget. Enforced via PreToolUse hook (which
+// supports per-message reset) — NO SDK-level maxTurns, because that's
+// per-query()-call lifetime and would silently break the per-message UX
+// when IPC piping is in effect within the idle window.
+// All caps fire independently — whichever hits first wins.
+const SOFT_CAP_TURNS = 40;
+const HARD_CAP_TURNS = 50;
+const SOFT_CAP_MS = 4 * 60_000; // 4 minutes wall-clock
+const HARD_CAP_MS = 5 * 60_000; // 5 minutes wall-clock
+const FAILSAFE_MS = 5 * 60_000 + 30_000; // 5m30s — synthetic result if no output
 
 /**
  * Push-based async iterable for streaming user messages to the SDK.
@@ -201,6 +215,74 @@ function createPreCompactHook(assistantName?: string): HookCallback {
       log(
         `Failed to archive transcript: ${err instanceof Error ? err.message : String(err)}`,
       );
+    }
+
+    return {};
+  };
+}
+
+/**
+ * Mutable budget state shared between the message stream loop and the hook.
+ * Created fresh per query so each turn gets its own budget.
+ */
+interface BudgetState {
+  startTime: number;
+  turnCounter: number;
+  hardCapHit: boolean;
+}
+
+/**
+ * PreToolUse hook factory. Soft-warns at 4 min / 25 turns, then hard-denies
+ * every subsequent tool call at 5 min / 30 turns. Forces the agent to either
+ * reply or fail rather than grind silently for the full 30-min container cap.
+ */
+function createBudgetHook(budget: BudgetState): HookCallback {
+  return async (input, _toolUseId, _context) => {
+    // PreToolUseHookInput has tool_name + tool_input
+    const ptu = input as PreToolUseHookInput;
+    const elapsedMs = Date.now() - budget.startTime;
+    const elapsedSec = Math.round(elapsedMs / 1000);
+    const turn = budget.turnCounter;
+
+    // HARD CAP — deny every subsequent tool call
+    if (
+      elapsedMs > HARD_CAP_MS ||
+      turn >= HARD_CAP_TURNS ||
+      budget.hardCapHit
+    ) {
+      budget.hardCapHit = true;
+      log(
+        `Budget HARD cap fired (elapsed=${elapsedSec}s turn=${turn} tool=${ptu.tool_name}) — denying`,
+      );
+      return {
+        decision: 'block' as const,
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse' as const,
+          permissionDecision: 'deny' as const,
+          permissionDecisionReason:
+            `BUDGET_EXHAUSTED: ${elapsedSec}s elapsed, ${turn} agent turns used. ` +
+            `Stop calling tools immediately. Reply to the user with: ` +
+            `(1) results so far, (2) what is still incomplete, ` +
+            `(3) a question asking which slice to handle next turn. ` +
+            `Every further tool call will be denied with this same message.`,
+        },
+      };
+    }
+
+    // SOFT CAP — let the call through but inject a system warning
+    if (elapsedMs > SOFT_CAP_MS || turn >= SOFT_CAP_TURNS) {
+      log(
+        `Budget SOFT cap nudge (elapsed=${elapsedSec}s turn=${turn} tool=${ptu.tool_name})`,
+      );
+      return {
+        decision: 'approve' as const,
+        systemMessage:
+          `⏱️ BUDGET WARNING: ${elapsedSec}s elapsed and ${turn} turns used. ` +
+          `You have less than 1 minute / 5 turns left before the hard cap. ` +
+          `After this tool call, stop and reply with: ` +
+          `(1) what you found, (2) what is still pending, ` +
+          `(3) ask the user which slice to do next. Do NOT keep calling tools.`,
+      };
     }
 
     return {};
@@ -386,6 +468,63 @@ async function runQuery(
   const stream = new MessageStream();
   stream.push(prompt);
 
+  let newSessionId: string | undefined;
+  let lastAssistantUuid: string | undefined;
+  let messageCount = 0;
+  let resultCount = 0;
+
+  // Per-USER-MESSAGE budget. Resets to zero whenever a new IPC message is
+  // pushed into the stream (see pollIpcDuringQuery below) so chatty
+  // conversations don't inherit each other's exhausted budgets.
+  const budget: BudgetState = {
+    startTime: Date.now(),
+    turnCounter: 0,
+    hardCapHit: false,
+  };
+
+  // Failsafe: if no NEW result has been emitted within FAILSAFE_MS of the
+  // current user turn, force a synthetic one. Tracks resultsAtTurnStart so
+  // it's per-user-turn, not cumulative-per-query.
+  let failsafeFired = false;
+  let resultsAtTurnStart = 0;
+  let failsafeTimer: NodeJS.Timeout | null = null;
+  const armFailsafe = () => {
+    if (failsafeTimer) clearTimeout(failsafeTimer);
+    resultsAtTurnStart = resultCount;
+    failsafeFired = false;
+    failsafeTimer = setTimeout(() => {
+      if (resultCount === resultsAtTurnStart) {
+        failsafeFired = true;
+        log(
+          `Failsafe fired at ${Math.round((Date.now() - budget.startTime) / 1000)}s — emitting synthetic result`,
+        );
+        writeOutput({
+          status: 'success',
+          result:
+            "⏱️ I hit my response budget for this turn without finishing. Send a smaller scope and I'll dig in.",
+          newSessionId,
+        });
+        stream.end();
+        ipcPolling = false;
+      }
+    }, FAILSAFE_MS);
+  };
+  armFailsafe();
+
+  // Reset budget + failsafe on each new user message (interactive UX). The
+  // initial prompt was already pushed above so the budget is correctly
+  // initialized at zero for the first turn; this only fires for IPC follow-ups.
+  const resetBudgetForNewTurn = (reason: string) => {
+    log(
+      `Resetting budget for new user turn (${reason}); previous: ` +
+        `${budget.turnCounter} turns / ${Math.round((Date.now() - budget.startTime) / 1000)}s`,
+    );
+    budget.startTime = Date.now();
+    budget.turnCounter = 0;
+    budget.hardCapHit = false;
+    armFailsafe();
+  };
+
   // Poll IPC for follow-up messages and _close sentinel during the query
   let ipcPolling = true;
   let closedDuringQuery = false;
@@ -402,15 +541,11 @@ async function runQuery(
     for (const text of messages) {
       log(`Piping IPC message into active query (${text.length} chars)`);
       stream.push(text);
+      resetBudgetForNewTurn('IPC follow-up');
     }
     setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
   };
   setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
-
-  let newSessionId: string | undefined;
-  let lastAssistantUuid: string | undefined;
-  let messageCount = 0;
-  let resultCount = 0;
 
   // Load global CLAUDE.md as additional system context (shared across all groups)
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
@@ -442,6 +577,10 @@ async function runQuery(
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
+      // NOTE: no SDK-level maxTurns. The PreToolUse hook below caps each
+      // user message at HARD_CAP_TURNS (and resets per-message), which
+      // gives correct UX. Adding maxTurns here would silently break the
+      // per-message reset because it's per-query()-call cumulative.
       systemPrompt: globalClaudeMd
         ? {
             type: 'preset' as const,
@@ -489,6 +628,24 @@ async function runQuery(
         PreCompact: [
           { hooks: [createPreCompactHook(containerInput.assistantName)] },
         ],
+        PreToolUse: [{ hooks: [createBudgetHook(budget)] }],
+        InstructionsLoaded: [
+          {
+            hooks: [
+              async (input) => {
+                const il = input as {
+                  file_path?: string;
+                  memory_type?: string;
+                  load_reason?: string;
+                };
+                log(
+                  `[InstructionsLoaded] type=${il.memory_type} reason=${il.load_reason} path=${il.file_path}`,
+                );
+                return {};
+              },
+            ],
+          },
+        ],
       },
     },
   })) {
@@ -501,6 +658,7 @@ async function runQuery(
 
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
+      budget.turnCounter++;
     }
 
     if (message.type === 'system' && message.subtype === 'init') {
@@ -538,8 +696,13 @@ async function runQuery(
   }
 
   ipcPolling = false;
+  if (failsafeTimer) clearTimeout(failsafeTimer);
   log(
-    `Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`,
+    `Query done. Messages: ${messageCount}, results: ${resultCount}, ` +
+      `lastAssistantUuid: ${lastAssistantUuid || 'none'}, ` +
+      `closedDuringQuery: ${closedDuringQuery}, ` +
+      `budget: ${budget.turnCounter} turns / ${Math.round((Date.now() - budget.startTime) / 1000)}s, ` +
+      `hardCapHit: ${budget.hardCapHit}, failsafeFired: ${failsafeFired}`,
   );
   return { newSessionId, lastAssistantUuid, closedDuringQuery };
 }
