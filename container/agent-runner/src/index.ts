@@ -72,11 +72,11 @@ const IPC_POLL_MS = 500;
 // per-query()-call lifetime and would silently break the per-message UX
 // when IPC piping is in effect within the idle window.
 // All caps fire independently — whichever hits first wins.
-const SOFT_CAP_TURNS = 40;
-const HARD_CAP_TURNS = 50;
-const SOFT_CAP_MS = 4 * 60_000; // 4 minutes wall-clock
-const HARD_CAP_MS = 5 * 60_000; // 5 minutes wall-clock
-const FAILSAFE_MS = 5 * 60_000 + 30_000; // 5m30s — synthetic result if no output
+const SOFT_CAP_TURNS = 60;
+const HARD_CAP_TURNS = 75;
+const SOFT_CAP_MS = 6 * 60_000; // 6 minutes wall-clock
+const HARD_CAP_MS = 8 * 60_000; // 8 minutes wall-clock
+const FAILSAFE_MS = 8 * 60_000 + 30_000; // 8m30s — synthetic result if no output
 
 /**
  * Push-based async iterable for streaming user messages to the SDK.
