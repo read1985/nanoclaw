@@ -47,7 +47,9 @@ import { normalizeName } from '../src/modules/agent-to-agent/db/agent-destinatio
 import { addMember } from '../src/modules/permissions/db/agent-group-members.js';
 import { getUserRoles, grantRole } from '../src/modules/permissions/db/user-roles.js';
 import { upsertUser } from '../src/modules/permissions/db/users.js';
+import { updateContainerConfigScalars } from '../src/db/container-configs.js';
 import { initGroupFilesystem } from '../src/group-init.js';
+import { namespacedPlatformId } from '../src/platform-id.js';
 import type { AgentGroup, MessagingGroup } from '../src/types.js';
 
 type Role = 'owner' | 'admin' | 'member';
@@ -135,16 +137,6 @@ function parseArgs(argv: string[]): Args {
 
 function namespacedUserId(channel: string, raw: string): string {
   return raw.includes(':') ? raw : `${channel}:${raw}`;
-}
-
-function namespacedPlatformId(channel: string, raw: string): string {
-  if (raw.startsWith(`${channel}:`)) return raw;
-  // Adapters using native JID format (WhatsApp: <phone>@s.whatsapp.net,
-  // <groupId>@g.us) store platform_id without a channel prefix. The '@' is
-  // the discriminator — telegram/discord platform_ids don't contain it
-  // except after a channel prefix, which is already handled above.
-  if (raw.includes('@')) return raw;
-  return `${channel}:${raw}`;
 }
 
 function generateId(prefix: string): string {
@@ -240,6 +232,8 @@ async function main(): Promise<void> {
         granted_at: now,
       });
     }
+    // Owner's agent group gets global CLI access
+    updateContainerConfigScalars(ag.id, { cli_scope: 'global' });
   } else if (args.role === 'admin') {
     const alreadyAdmin = existingRoles.some(
       (r) => r.role === 'admin' && r.agent_group_id === ag.id,
