@@ -18,7 +18,11 @@ import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { ApprovalHandler } from '../approvals/index.js';
 
-export const applyInstallPackages: ApprovalHandler = async ({ session, payload, userId, notify }) => {
+export const applyInstallPackages: ApprovalHandler = async ({ session, payload, userId, approved, notify }) => {
+  if (!approved) {
+    notify(`install_packages request was rejected by admin.`);
+    return;
+  }
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
     notify('install_packages approved but agent group missing.');
@@ -65,7 +69,11 @@ export const applyInstallPackages: ApprovalHandler = async ({ session, payload, 
   }
 };
 
-export const applyAddMcpServer: ApprovalHandler = async ({ session, payload, userId, notify }) => {
+export const applyAddMcpServer: ApprovalHandler = async ({ session, payload, userId, approved, notify }) => {
+  if (!approved) {
+    notify(`add_mcp_server request was rejected by admin.`);
+    return;
+  }
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
     notify('add_mcp_server approved but agent group missing.');

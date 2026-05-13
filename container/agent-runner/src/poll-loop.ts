@@ -40,7 +40,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   // was persisted. The continuation is opaque to the poll-loop — the
   // provider decides how to use it (Claude resumes a .jsonl transcript,
   // other providers may reload a thread ID, etc.).
+  try {
+    const { getOutboundDb } = await import("./db/connection.js");
+    const rows = getOutboundDb().prepare("SELECT key, value, updated_at FROM session_state").all();
+    log("DEBUG session_state rows at poll-loop start: " + JSON.stringify(rows));
+  } catch (e) {
+    log("DEBUG session_state dump failed: " + (e instanceof Error ? e.message : String(e)));
+  }
   let continuation: string | undefined = getStoredSessionId();
+  log("DEBUG getStoredSessionId: " + (continuation ?? "(undef)"));
 
   if (continuation) {
     log(`Resuming agent session ${continuation}`);
@@ -149,11 +157,21 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
 
+    // Cron-initiated batches bypass the provider's per-tool-call approval
+    // gate (see container/agent-runner/src/providers/claude.ts). Scheduled
+    // tasks are implicitly authorised by the schedule itself and have no
+    // human in the loop to tap a Discord approval card; without this flag
+    // the cron times out at the 5-min approval window every run. Budget
+    // caps still apply. Detection: any task-kind message in the kept batch
+    // — chat-only batches always go through the gate.
+    const fromScheduledTask = keep.some((m) => m.kind === 'task');
+
     const query = config.provider.query({
       prompt,
       continuation,
       cwd: config.cwd,
       systemContext: config.systemContext,
+      fromScheduledTask,
     });
 
     // Process the query while concurrently polling for new messages
@@ -167,15 +185,17 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      log(`Query error: ${errMsg}`);
 
-      // Stale/corrupt continuation recovery: ask the provider whether
-      // this error means the stored continuation is unusable, and clear
-      // it so the next attempt starts fresh.
+      // Stale/corrupt continuation recovery: when the provider tells us the
+      // stored continuation is unusable, clear it and emit a single
+      // INFO-level line on stdout. Without this branch the host treats the
+      // self-healing path as an ERROR (poll-loop's `log` writes to stderr).
       if (continuation && config.provider.isSessionInvalid(err)) {
-        log(`Stale session detected (${continuation}) — clearing for next retry`);
+        console.log(`[poll-loop] Stale session detected (${continuation}) — cleared for retry`);
         continuation = undefined;
         clearStoredSessionId();
+      } else {
+        log(`Query error: ${errMsg}`);
       }
 
       // Write error response so the user knows something went wrong

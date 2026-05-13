@@ -46,8 +46,12 @@ const APPROVAL_OPTIONS: RawOption[] = [
 export interface ApprovalHandlerContext {
   session: Session;
   payload: Record<string, unknown>;
-  /** User ID of the admin who approved. Empty string if unknown. */
+  /** User ID of the admin who approved or rejected. Empty string if unknown. */
   userId: string;
+  /** True if approved, false if rejected. Handlers that previously assumed
+   * approve-only can ignore this; ones that need to unblock a waiter on reject
+   * (e.g. per-tool-call approval gate) can branch on it. */
+  approved: boolean;
   /** Send a system chat message to the requesting agent's session. */
   notify: (text: string) => void;
 }

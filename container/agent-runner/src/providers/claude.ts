@@ -1,7 +1,12 @@
 import fs from 'fs';
 import path from 'path';
 
-import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
+import {
+  query as sdkQuery,
+  type HookCallback,
+  type PreCompactHookInput,
+  type PreToolUseHookInput,
+} from '@anthropic-ai/claude-agent-sdk';
 
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
 import { registerProvider } from './provider-registry.js';
@@ -56,6 +61,49 @@ const TOOL_ALLOWLIST = [
   'NotebookEdit',
   'mcp__nanoclaw__*',
 ];
+
+// ── Budget caps (ported from v1 container/agent-runner/src/index.ts) ──
+// Per-USER-MESSAGE caps. Budget state is created fresh per query() call and
+// reset on each push() from the host so a chatty conversation never inherits
+// the previous turn's budget.
+const SOFT_CAP_TURNS = 60;
+const HARD_CAP_TURNS = 75;
+const SOFT_CAP_MS = 6 * 60_000;
+const HARD_CAP_MS = 8 * 60_000;
+
+// ── Per-tool-call approval gate (ported from v1) ──
+// Matching tool calls are paused by the PreToolUse hook, which writes a
+// request JSON to /workspace/ipc/approvals/ and waits for a response JSON
+// from the host. Budget timer is rewound by the wait duration so user
+// think-time doesn't consume the agent's budget.
+interface ApprovalPattern {
+  tool: string;
+  match: (toolInput: Record<string, unknown>) => string | null;
+}
+const APPROVAL_PATTERNS: ApprovalPattern[] = [
+  {
+    tool: 'Bash',
+    match: (i) => {
+      const cmd = typeof i.command === 'string' ? i.command : '';
+      if (/\b(gmail|gcal|gdocs)\.py\b.*\b(send|reply|forward|trash|delete|move|untrash)\b/.test(cmd)) {
+        return 'Gmail/Calendar/Docs mutation';
+      }
+      if (/\bdropbox\.py\b.*\b(delete|move|share)\b/.test(cmd)) {
+        return 'Dropbox mutation';
+      }
+      if (/\bnotion\.py\b.*\b(delete|archive)\b/.test(cmd)) {
+        return 'Notion destructive';
+      }
+      if (/\b(p3|python3?)\s+\S*portal_login\.py\b/.test(cmd)) {
+        return 'Portal login (vault credential use)';
+      }
+      return null;
+    },
+  },
+];
+const APPROVAL_TIMEOUT_MS = 5 * 60_000;
+const APPROVAL_POLL_INTERVAL_MS = 500;
+const APPROVAL_IPC_DIR = '/workspace/ipc/approvals';
 
 interface SDKUserMessage {
   type: 'user';
@@ -178,6 +226,207 @@ const postToolUseHook: HookCallback = async () => {
   return { continue: true };
 };
 
+/**
+ * Mutable budget state shared between the event translator and the hooks.
+ * Created fresh per query() call; reset to zero on each push() from the host.
+ */
+interface BudgetState {
+  startTime: number;
+  turnCounter: number;
+  hardCapHit: boolean;
+  approvalInFlight: boolean;
+}
+
+/**
+ * Soft-warns at 6min / 60 turns then hard-denies every subsequent tool call
+ * at 8min / 75 turns. Forces the agent to either reply or fail rather than
+ * grind silently.
+ */
+function createBudgetHook(budget: BudgetState): HookCallback {
+  return async (input) => {
+    const ptu = input as PreToolUseHookInput;
+    // While approval hook is awaiting a user tap, don't count wall-clock
+    // against the budget — the approval hook shifts startTime forward when
+    // it resolves, but we short-circuit here to guarantee we don't trip
+    // hard-cap mid-wait.
+    if (budget.approvalInFlight) return { continue: true };
+
+    const elapsedMs = Date.now() - budget.startTime;
+    const elapsedSec = Math.round(elapsedMs / 1000);
+    const turn = budget.turnCounter;
+
+    if (elapsedMs > HARD_CAP_MS || turn >= HARD_CAP_TURNS || budget.hardCapHit) {
+      budget.hardCapHit = true;
+      log(`Budget HARD cap (elapsed=${elapsedSec}s turn=${turn} tool=${ptu.tool_name}) — denying`);
+      return {
+        decision: 'block',
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason:
+            `BUDGET_EXHAUSTED: ${elapsedSec}s elapsed, ${turn} agent turns used. ` +
+            `Stop calling tools immediately. Reply to the user with: ` +
+            `(1) results so far, (2) what is still incomplete, ` +
+            `(3) a question asking which slice to handle next turn. ` +
+            `Every further tool call will be denied with this same message.`,
+        },
+      } as unknown as ReturnType<HookCallback>;
+    }
+
+    if (elapsedMs > SOFT_CAP_MS || turn >= SOFT_CAP_TURNS) {
+      log(`Budget SOFT cap (elapsed=${elapsedSec}s turn=${turn} tool=${ptu.tool_name})`);
+      return {
+        decision: 'approve',
+        systemMessage:
+          `⏱️ BUDGET WARNING: ${elapsedSec}s elapsed and ${turn} turns used. ` +
+          `You have less than 2 minutes / 15 turns before hard cap. ` +
+          `After this tool call, stop and reply with: ` +
+          `(1) what you found, (2) what is still pending, ` +
+          `(3) ask the user which slice to do next. Do NOT keep calling tools.`,
+      } as unknown as ReturnType<HookCallback>;
+    }
+
+    return { continue: true };
+  };
+}
+
+/**
+ * Poll /workspace/ipc/approvals/resp-{reqId}.json until it appears or timeout.
+ */
+function waitForApprovalFile(
+  respPath: string,
+  timeoutMs: number,
+  pollMs: number,
+): Promise<{ approved: boolean; reason?: string; decidedBy?: string } | null> {
+  return new Promise((resolve) => {
+    const deadline = Date.now() + timeoutMs;
+    const poll = (): void => {
+      if (fs.existsSync(respPath)) {
+        try {
+          const data = JSON.parse(fs.readFileSync(respPath, 'utf-8'));
+          resolve({
+            approved: !!data.approved,
+            reason: typeof data.reason === 'string' ? data.reason : undefined,
+            decidedBy: typeof data.decidedBy === 'string' ? data.decidedBy : undefined,
+          });
+          return;
+        } catch (err) {
+          log(`Failed to parse approval response ${respPath}: ${err instanceof Error ? err.message : String(err)}`);
+          resolve(null);
+          return;
+        }
+      }
+      if (Date.now() >= deadline) {
+        resolve(null);
+        return;
+      }
+      setTimeout(poll, pollMs);
+    };
+    poll();
+  });
+}
+
+/**
+ * For tool calls that match APPROVAL_PATTERNS, writes an approval request to
+ * IPC and blocks until a response is written. Rewinds the budget timer by the
+ * wait duration so user think-time doesn't consume the agent's budget.
+ */
+function createApprovalHook(budget: BudgetState): HookCallback {
+  return async (input, toolUseId) => {
+    const ptu = input as PreToolUseHookInput;
+    const toolName = ptu.tool_name;
+    const toolInput = (ptu.tool_input ?? {}) as Record<string, unknown>;
+
+    let reason: string | null = null;
+    for (const pat of APPROVAL_PATTERNS) {
+      if (pat.tool !== toolName) continue;
+      const r = pat.match(toolInput);
+      if (r) {
+        reason = r;
+        break;
+      }
+    }
+    if (!reason) return { continue: true };
+
+    const preview =
+      toolName === 'Bash' && typeof toolInput.command === 'string'
+        ? (toolInput.command as string).slice(0, 1500)
+        : JSON.stringify(toolInput).slice(0, 1500);
+
+    const reqId = `${Date.now()}-${toolUseId || Math.random().toString(36).slice(2, 10)}`;
+    const reqPath = `${APPROVAL_IPC_DIR}/req-${reqId}.json`;
+    const respPath = `${APPROVAL_IPC_DIR}/resp-${reqId}.json`;
+    try {
+      fs.mkdirSync(APPROVAL_IPC_DIR, { recursive: true });
+    } catch {
+      /* ignore */
+    }
+    try {
+      fs.writeFileSync(
+        reqPath,
+        JSON.stringify({
+          reqId,
+          toolName,
+          toolInput,
+          preview,
+          reason,
+          createdAt: new Date().toISOString(),
+        }),
+      );
+    } catch (err) {
+      log(`Failed to write approval request ${reqPath}: ${err instanceof Error ? err.message : String(err)} — failing closed (deny)`);
+      return {
+        decision: 'block',
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason: 'Internal error: could not post approval request. Tool call blocked.',
+        },
+      } as unknown as ReturnType<HookCallback>;
+    }
+
+    log(`Approval requested: ${reason} (reqId=${reqId})`);
+    const pauseStart = Date.now();
+    budget.approvalInFlight = true;
+    const resp = await waitForApprovalFile(respPath, APPROVAL_TIMEOUT_MS, APPROVAL_POLL_INTERVAL_MS);
+    const waitedMs = Date.now() - pauseStart;
+
+    // Don't count approval-wait against budget
+    budget.startTime += waitedMs;
+    budget.approvalInFlight = false;
+
+    log(`Approval ${resp?.approved ? 'granted' : resp ? 'denied' : 'timed out'} after ${Math.round(waitedMs / 1000)}s (reqId=${reqId})`);
+
+    try {
+      if (fs.existsSync(reqPath)) fs.unlinkSync(reqPath);
+    } catch {
+      /* ignore */
+    }
+    try {
+      if (fs.existsSync(respPath)) fs.unlinkSync(respPath);
+    } catch {
+      /* ignore */
+    }
+
+    if (resp?.approved) return { continue: true };
+
+    const denyReason = resp
+      ? `User denied approval${resp.reason ? `: ${resp.reason}` : ''}.`
+      : `User approval timed out after ${Math.round(APPROVAL_TIMEOUT_MS / 60_000)} min — treating as denied.`;
+
+    return {
+      decision: 'block',
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason:
+          `${denyReason} Do NOT retry this exact action. Reply to the user ` +
+          `explaining what you wanted to do and ask for direction on how to proceed.`,
+      },
+    } as unknown as ReturnType<HookCallback>;
+  };
+}
+
 function createPreCompactHook(assistantName?: string): HookCallback {
   return async (input) => {
     const preCompact = input as PreCompactHookInput;
@@ -263,7 +512,33 @@ export class ClaudeProvider implements AgentProvider {
     const stream = new MessageStream();
     stream.push(input.prompt);
 
+    // Per-query budget state. Reset on each host push() so each new user
+    // message starts fresh.
+    const budget: BudgetState = {
+      startTime: Date.now(),
+      turnCounter: 0,
+      hardCapHit: false,
+      approvalInFlight: false,
+    };
+
     const instructions = input.systemContext?.instructions;
+
+    // Cron-initiated batches skip the per-tool-call approval gate. The
+    // schedule itself is the authorisation event — there's no human in the
+    // loop to tap a Discord card, and without this every scheduled task
+    // that touches an APPROVAL_PATTERNS-matched tool (gmail send, dropbox
+    // delete, portal_login, …) times out after 5 min and the cron run
+    // fails. Budget caps still apply. The flag is set by poll-loop.ts when
+    // any message in the batch is kind='task'.
+    const skipApprovalGate = input.fromScheduledTask === true;
+    if (skipApprovalGate) {
+      log('Approval gate bypassed for this query (fromScheduledTask=true)');
+    }
+    const preToolUseHooks = [
+      { hooks: [preToolUseHook] },
+      ...(skipApprovalGate ? [] : [{ hooks: [createApprovalHook(budget)] }]),
+      { hooks: [createBudgetHook(budget)] },
+    ];
 
     const sdkResult = sdkQuery({
       prompt: stream,
@@ -281,7 +556,7 @@ export class ClaudeProvider implements AgentProvider {
         settingSources: ['project', 'user'],
         mcpServers: this.mcpServers,
         hooks: {
-          PreToolUse: [{ hooks: [preToolUseHook] }],
+          PreToolUse: preToolUseHooks,
           PostToolUse: [{ hooks: [postToolUseHook] }],
           PostToolUseFailure: [{ hooks: [postToolUseHook] }],
           PreCompact: [{ hooks: [createPreCompactHook(this.assistantName)] }],
@@ -296,6 +571,11 @@ export class ClaudeProvider implements AgentProvider {
       for await (const message of sdkResult) {
         if (aborted) return;
         messageCount++;
+
+        // Increment agent turn counter for budget cap tracking.
+        if (message.type === 'assistant') {
+          budget.turnCounter++;
+        }
 
         // Yield activity for every SDK event so the poll loop knows the agent is working
         yield { type: 'activity' };
@@ -318,11 +598,18 @@ export class ClaudeProvider implements AgentProvider {
           yield { type: 'progress', message: tn.summary || 'Task notification' };
         }
       }
-      log(`Query completed after ${messageCount} SDK messages`);
+      log(`Query completed after ${messageCount} SDK messages (budget: ${budget.turnCounter} turns / ${Math.round((Date.now() - budget.startTime) / 1000)}s, hardCap=${budget.hardCapHit})`);
     }
 
     return {
-      push: (msg) => stream.push(msg),
+      push: (msg) => {
+        // Host is pushing a new user message — reset the per-message budget.
+        log(`Resetting budget for new user turn (previous: ${budget.turnCounter} turns / ${Math.round((Date.now() - budget.startTime) / 1000)}s)`);
+        budget.startTime = Date.now();
+        budget.turnCounter = 0;
+        budget.hardCapHit = false;
+        stream.push(msg);
+      },
       end: () => stream.end(),
       events: translateEvents(),
       abort: () => {

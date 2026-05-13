@@ -47,6 +47,17 @@ export interface QueryInput {
   systemContext?: {
     instructions?: string;
   };
+
+  /**
+   * True when this query is being invoked because the batch contains a
+   * scheduled (cron) task message. The Claude provider uses this to skip
+   * the per-tool-call approval gate — cron-initiated calls are implicitly
+   * authorised by the schedule, and there is no human in the loop to tap
+   * the Discord approval card. The budget cap still applies.
+   *
+   * Set by poll-loop.ts when any message in the keep batch has kind='task'.
+   */
+  fromScheduledTask?: boolean;
 }
 
 export interface McpServerConfig {

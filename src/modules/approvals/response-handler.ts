@@ -69,17 +69,25 @@ async function handleRegisteredApproval(
     });
   };
 
-  if (selectedOption !== 'approve') {
-    notify(`Your ${approval.action} request was rejected by admin.`);
+  const approved = selectedOption === 'approve';
+  if (!approved) {
     log.info('Approval rejected', { approvalId: approval.approval_id, action: approval.action, userId });
-    deletePendingApproval(approval.approval_id);
-    await wakeContainer(session);
-    return;
   }
 
-  // Approved — dispatch to the module that registered for this action.
+  // Dispatch to the module that registered for this action. Fires on both
+  // approve and reject — handlers branch on ctx.approved. Reject-notification
+  // was previously inline here; handlers that don't care about the reject
+  // still receive it but can ignore. Handlers that DO care (e.g. per-tool-call
+  // approval gate) can write a deny response so the waiter unblocks instead
+  // of hitting the 5-min poll timeout.
   const handler = getApprovalHandler(approval.action);
   if (!handler) {
+    if (!approved) {
+      notify(`Your ${approval.action} request was rejected by admin.`);
+      deletePendingApproval(approval.approval_id);
+      await wakeContainer(session);
+      return;
+    }
     log.warn('No approval handler registered — row dropped', {
       approvalId: approval.approval_id,
       action: approval.action,
@@ -92,12 +100,12 @@ async function handleRegisteredApproval(
 
   const payload = JSON.parse(approval.payload);
   try {
-    await handler({ session, payload, userId, notify });
-    log.info('Approval handled', { approvalId: approval.approval_id, action: approval.action, userId });
+    await handler({ session, payload, userId, approved, notify });
+    log.info('Approval handled', { approvalId: approval.approval_id, action: approval.action, approved, userId });
   } catch (err) {
     log.error('Approval handler threw', { approvalId: approval.approval_id, action: approval.action, err });
     notify(
-      `Your ${approval.action} was approved, but applying it failed: ${err instanceof Error ? err.message : String(err)}.`,
+      `Your ${approval.action} ${approved ? 'was approved, but applying it failed' : 'rejection could not be recorded'}: ${err instanceof Error ? err.message : String(err)}.`,
     );
   }
 
