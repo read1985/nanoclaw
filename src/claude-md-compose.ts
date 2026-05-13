@@ -100,6 +100,25 @@ export function composeGroupClaudeMd(group: AgentGroup): void {
     }
   }
 
+  // Per-group identity fragment — host file `groups/<folder>/identity-fragment.md`
+  // is RW (it's under the group dir which mounts RW at /workspace/agent inside
+  // the container). The agent edits it from inside the container; on next
+  // spawn we read its current contents and inline them into the composed
+  // CLAUDE.md so the change takes effect. The .claude-fragments target is RO,
+  // but reconcile rewrites the inline content from source on every spawn —
+  // so agent edits to /workspace/agent/identity-fragment.md persist across
+  // spawns without being clobbered.
+  const identityFragmentPath = path.join(groupDir, 'identity-fragment.md');
+  if (fs.existsSync(identityFragmentPath)) {
+    const identityContent = fs.readFileSync(identityFragmentPath, 'utf-8');
+    if (identityContent.trim().length > 0) {
+      desired.set(`zz-identity-fragment.md`, {
+        type: 'inline',
+        content: identityContent,
+      });
+    }
+  }
+
   // Reconcile: drop stale, write desired.
   for (const existing of fs.readdirSync(fragmentsDir)) {
     if (!desired.has(existing)) {
@@ -119,6 +138,14 @@ export function composeGroupClaudeMd(group: AgentGroup): void {
   const imports = ['@./.claude-shared.md'];
   for (const name of [...desired.keys()].sort()) {
     imports.push(`@./.claude-fragments/${name}`);
+  }
+  // Append the global persona (identity/memories/tool docs) if present.
+  // global/ is mounted at /workspace/global/ inside the container by
+  // src/container-runner.ts buildMounts. Sunshine-specific: v1 appended
+  // global/CLAUDE.md to every group; v2 restores that behavior opt-in.
+  const globalClaudeMd = path.join(GROUPS_DIR, 'global', 'CLAUDE.md');
+  if (fs.existsSync(globalClaudeMd)) {
+    imports.push('@/workspace/global/CLAUDE.md');
   }
   const body = [COMPOSED_HEADER, ...imports, ''].join('\n');
   writeAtomic(path.join(groupDir, 'CLAUDE.md'), body);
@@ -171,11 +198,16 @@ export function migrateGroupsToClaudeLocal(): void {
     }
   }
 
-  const globalDir = path.join(GROUPS_DIR, 'global');
-  if (fs.existsSync(globalDir)) {
-    fs.rmSync(globalDir, { recursive: true, force: true });
-    actions.push('groups/global/ removed');
-  }
+  // Sunshine-specific: keep groups/global/ as the location for the v1 persona
+  // (identity/memories/tool docs) + Python tools dir (gmail.py, gcal.py, etc.).
+  // claude-md-compose imports it into every composed CLAUDE.md; container-runner
+  // mounts it at /workspace/global. Leaving the original v1-cutover rmSync in
+  // place would wipe both on every host restart.
+  // const globalDir = path.join(GROUPS_DIR, 'global');
+  // if (fs.existsSync(globalDir)) {
+  //   fs.rmSync(globalDir, { recursive: true, force: true });
+  //   actions.push('groups/global/ removed');
+  // }
 
   if (actions.length > 0) {
     log.info('Migrated groups to CLAUDE.local.md model', { actions });
