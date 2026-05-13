@@ -119,6 +119,14 @@ RUN --mount=type=cache,target=/root/.cache/pnpm     pnpm install -g "@bitwarden/
 RUN printf '#!/bin/sh\nexec bun /app/src/cli/ncl.ts "$@"\n' > /usr/local/bin/ncl && \
     chmod +x /usr/local/bin/ncl
 
+# ---- QMD shim ----------------------------------------------------------------
+# Container reaches the host-side qmd-server via http://host.docker.internal:8183.
+# We DO NOT install the qmd CLI or its ~2GB of LLM models in the image - the
+# agent only needs to call search/get; the host runs everything heavy. See
+# groups/global/tools/qmd-server.mjs.
+COPY qmd-shim.py /usr/local/bin/qmd
+RUN chmod +x /usr/local/bin/qmd
+
 # ---- Entrypoint --------------------------------------------------------------
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
