@@ -70,10 +70,40 @@ export interface QueryInput {
   fromScheduledTask?: boolean;
 }
 
-export interface McpServerConfig {
+/**
+ * MCP server config — discriminated union matching the Claude Agent SDK shape.
+ *
+ * stdio: spawned as a subprocess inside the container. Use for tools that
+ *   need container-local state (e.g. the nanoclaw built-in).
+ *
+ * http: fetched over HTTP. Use for tools that run on the host (e.g. qmd —
+ *   keeping its 2GB of LLM models off the container image). Container reaches
+ *   the host via http://host.docker.internal:<port> (Linux Docker maps
+ *   host-gateway to docker0, set up in src/container-runtime.ts).
+ */
+export type McpServerConfig =
+  | McpStdioServerConfig
+  | McpHttpServerConfig;
+
+export interface McpStdioServerConfig {
+  type?: 'stdio';
   command: string;
   args: string[];
   env: Record<string, string>;
+  alwaysLoad?: boolean;
+}
+
+export interface McpHttpServerConfig {
+  type: 'http';
+  url: string;
+  headers?: Record<string, string>;
+  /**
+   * When true, the server's tools are always present in the prompt (not
+   * deferred behind tool search). Set this on memory-lookup MCP servers
+   * (e.g. qmd) so the agent reaches for them at turn 1 instead of having
+   * to discover them.
+   */
+  alwaysLoad?: boolean;
 }
 
 export interface AgentQuery {

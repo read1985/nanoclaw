@@ -89,8 +89,12 @@ def main():
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    # The agent container has HTTP_PROXY pointed at the OneCLI credential
+    # gateway for outbound LLM traffic. We MUST bypass it for the host-local
+    # qmd-server — otherwise our request gets hijacked and returns empty.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT_SEC) as resp:
+        with opener.open(req, timeout=TIMEOUT_SEC) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.URLError as e:
         sys.stderr.write(f"qmd-server unreachable at {QMD_SERVER}: {e}\n")

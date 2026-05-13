@@ -460,6 +460,11 @@ async function buildContainerArgs(
   if (agentIdentifier) {
     await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
   }
+  // NO_PROXY for host-local MCP servers (qmd at host.docker.internal:8182,
+  // OpenObserve at 5080, etc.). Set BEFORE OneCLI's applyContainerConfig
+  // so OneCLI's HTTPS_PROXY doesn't hijack our host-bound traffic.
+  args.push('-e', 'NO_PROXY=host.docker.internal,172.17.0.1,localhost,127.0.0.1');
+  args.push('-e', 'no_proxy=host.docker.internal,172.17.0.1,localhost,127.0.0.1');
   const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
   if (!onecliApplied) {
     throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');

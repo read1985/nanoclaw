@@ -72,18 +72,30 @@ async function main(): Promise<void> {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'mcp-tools', 'index.ts');
 
-  // Build MCP servers config: nanoclaw built-in + any from container.json
-  const mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }> = {
+  // Build MCP servers config: nanoclaw built-in + qmd memory search + any from container.json.
+  // Type matches the SDK union (stdio | http) so we can mix transports.
+  const mcpServers: Record<string, import('./providers/types.js').McpServerConfig> = {
     nanoclaw: {
       command: 'bun',
       args: ['run', mcpServerPath],
       env: {},
     },
+    // QMD = host-side semantic memory search (BM25 + vector + rerank over
+    // groups/global/*.md, daily-memories/*.md, and conversations/*.md).
+    // Runs as a host service so the container stays slim. alwaysLoad=true
+    // so the agent sees mcp__qmd__query at turn 1, no tool-search step.
+    // See groups/global/tools/qmd-server.mjs.
+    qmd: {
+      type: 'http',
+      url: 'http://host.docker.internal:8182/mcp',
+      alwaysLoad: true,
+    },
   };
 
   for (const [name, serverConfig] of Object.entries(config.mcpServers)) {
     mcpServers[name] = serverConfig;
-    log(`Additional MCP server: ${name} (${serverConfig.command})`);
+    const transport = 'type' in serverConfig && serverConfig.type === 'http' ? 'http' : 'stdio';
+    log(`Additional MCP server: ${name} (${transport})`);
   }
 
   const provider = createProvider(providerName, {
