@@ -50,7 +50,13 @@ const SWEEP_INTERVAL_MS = 60_000;
 // Absolute idle ceiling for a running container. If the heartbeat file hasn't
 // been touched in this long, the container is either stuck or doing genuinely
 // nothing — kill and restart on the next inbound.
-export const ABSOLUTE_CEILING_MS = 30 * 60 * 1000;
+//
+// Default 3 hours (was 30 min). Override via ABSOLUTE_CEILING_MS env var
+// (milliseconds). Raised because mid-conversation kills wipe in-conversation
+// Claude Code context — file-based memory survives but the agent loses the
+// thread of what was just discussed, leading to "Sunshine forgot what we
+// were just talking about" symptoms.
+export const ABSOLUTE_CEILING_MS = parseInt(process.env.ABSOLUTE_CEILING_MS || `${3 * 60 * 60 * 1000}`, 10);
 // Stuck tolerance window applied per 'processing' claim — "did we see any
 // signs of life since this message was claimed?"
 export const CLAIM_STUCK_MS = 60 * 1000;

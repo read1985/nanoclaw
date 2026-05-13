@@ -9,7 +9,15 @@ import path from 'path';
 
 import { OneCLI } from '@onecli-sh/sdk';
 
-import { CONTAINER_IMAGE, DATA_DIR, GROUPS_DIR, ONECLI_API_KEY, ONECLI_URL, TIMEZONE } from './config.js';
+import {
+  ASSISTANT_NAME,
+  CONTAINER_IMAGE,
+  DATA_DIR,
+  GROUPS_DIR,
+  ONECLI_API_KEY,
+  ONECLI_URL,
+  TIMEZONE,
+} from './config.js';
 import { readContainerConfig, writeContainerConfig } from './container-config.js';
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
@@ -107,9 +115,10 @@ async function spawnContainer(session: Session): Promise<void> {
 
   const mounts = buildMounts(agentGroup, session, containerConfig, contribution);
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
-  // OneCLI agent identifier is always the agent group id — stable across
-  // sessions and reversible via getAgentGroup() for approval routing.
-  const agentIdentifier = agentGroup.id;
+  // OneCLI agent identifier derived from folder (lowercase, hyphens only) —
+  // matches v1 naming scheme + existing OneCLI agents with per-group secrets
+  // (gmail, notion, dropbox). agentGroup.id has underscores which OneCLI rejects.
+  const agentIdentifier = agentGroup.folder.toLowerCase().replace(/_/g, '-');
   const args = await buildContainerArgs(
     mounts,
     containerName,
@@ -204,6 +213,25 @@ function buildMounts(
   const claudeDir = path.join(DATA_DIR, 'v2-sessions', agentGroup.id, '.claude-shared');
   syncSkillSymlinks(claudeDir, containerConfig);
 
+  // Claude Code 2.1.116 creates .claude.json.backup.* files when it boots;
+  // on the NEXT spawn those trigger a "restore .claude.json from backup"
+  // prompt that exits claude immediately (no real .claude.json exists to
+  // restore into). Backup contents are trivial ({firstStartTime}), so wiping
+  // them pre-spawn is safe. Without this, Claude Code repeatedly fails with
+  // "Not logged in - Please run /login" on subsequent runs.
+  try {
+    const backupsDir = path.join(claudeDir, 'backups');
+    if (fs.existsSync(backupsDir)) {
+      for (const f of fs.readdirSync(backupsDir)) {
+        if (f.startsWith('.claude.json.backup.')) {
+          fs.unlinkSync(path.join(backupsDir, f));
+        }
+      }
+    }
+  } catch (err) {
+    log.warn('Failed to clean .claude.json backups pre-spawn', { err });
+  }
+
   // Compose CLAUDE.md fresh every spawn from the shared base, enabled skill
   // fragments, and MCP server instructions. See `claude-md-compose.ts`.
   composeGroupClaudeMd(agentGroup);
@@ -241,10 +269,16 @@ function buildMounts(
     mounts.push({ hostPath: fragmentsDir, containerPath: '/workspace/agent/.claude-fragments', readonly: true });
   }
 
-  // Global memory directory — always read-only.
+  // Global memory directory — read-only at /workspace/global (canonical read path
+  // referenced by composed CLAUDE.md and per-group instructions). Sunshine-specific:
+  // ALSO mounted RW at /workspace/global-rw (same host dir, RW view) so the agent
+  // can update shared memory files (kids-school.md, memories.md, daily-memories/, etc.)
+  // and have those updates immediately visible to every other group via the RO mount.
+  // Without this, memory updates fall back to per-group files invisible cross-channel.
   const globalDir = path.join(GROUPS_DIR, 'global');
   if (fs.existsSync(globalDir)) {
     mounts.push({ hostPath: globalDir, containerPath: '/workspace/global', readonly: true });
+    mounts.push({ hostPath: globalDir, containerPath: '/workspace/global-rw', readonly: false });
   }
 
   // Shared CLAUDE.md — read-only, imported by the composed entry point via
@@ -363,8 +397,12 @@ function ensureRuntimeFields(
     containerConfig.groupName = agentGroup.name;
     dirty = true;
   }
-  if (containerConfig.assistantName !== agentGroup.name) {
-    containerConfig.assistantName = agentGroup.name;
+  // v2 default: assistantName follows group name. Sunshine overrides with
+  // ASSISTANT_NAME env var so every group shares the same persona (Jarvis).
+  // config.ts defaults ASSISTANT_NAME to "Andy" when .env has no entry; treat the default as "not overridden" and fall back to the group name in that case.
+  const desiredAssistantName = ASSISTANT_NAME !== 'Andy' ? ASSISTANT_NAME : agentGroup.name;
+  if (containerConfig.assistantName !== desiredAssistantName) {
+    containerConfig.assistantName = desiredAssistantName;
     dirty = true;
   }
   if (dirty) {
@@ -387,6 +425,14 @@ async function buildContainerArgs(
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
   args.push('-e', `TZ=${TIMEZONE}`);
 
+  // Forward OTEL telemetry env vars from host to container when present.
+  // Paired with OpenObserve systemd unit running on 127.0.0.1:5080.
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value && (key === 'CLAUDE_CODE_ENABLE_TELEMETRY' || key.startsWith('OTEL_'))) {
+      args.push('-e', `${key}=${value}`);
+    }
+  }
+
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   if (providerContribution.env) {
     for (const [key, value] of Object.entries(providerContribution.env)) {
@@ -394,8 +440,6 @@ async function buildContainerArgs(
     }
   }
 
-  // OneCLI gateway — injects HTTPS_PROXY + certs so container API calls
-  // are routed through the agent vault for credential injection.
   try {
     if (agentIdentifier) {
       await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
@@ -407,7 +451,27 @@ async function buildContainerArgs(
       log.warn('OneCLI gateway not applied — container will have no credentials', { containerName });
     }
   } catch (err) {
-    log.warn('OneCLI gateway error — container will have no credentials', { containerName, err });
+    // Surface enough request shape to diagnose 400s without leaking secrets:
+    // env keys (no values), agent identifier, and any response body the SDK
+    // attached to the error (shape varies across @onecli-sh/sdk versions).
+    const envKeys: string[] = [];
+    for (let i = 0; i < args.length - 1; i++) {
+      if (args[i] === '-e' && typeof args[i + 1] === 'string') {
+        const eq = args[i + 1].indexOf('=');
+        envKeys.push(eq === -1 ? args[i + 1] : args[i + 1].slice(0, eq));
+      }
+    }
+    const errResp = err as
+      | { body?: unknown; response?: { status?: number; body?: unknown; data?: unknown } }
+      | undefined;
+    log.warn('OneCLI gateway error — container will have no credentials', {
+      containerName,
+      agentIdentifier,
+      agentGroupName: agentGroup.name,
+      envKeys,
+      oneCliBody: errResp?.body ?? errResp?.response,
+      err,
+    });
   }
 
   // Host gateway
