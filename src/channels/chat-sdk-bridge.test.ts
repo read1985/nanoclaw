@@ -2,7 +2,14 @@ import { describe, expect, it } from 'vitest';
 
 import type { Adapter } from 'chat';
 
-import { createChatSdkBridge, splitForLimit } from './chat-sdk-bridge.js';
+import {
+  createChatSdkBridge,
+  deliverWithDiscord429Retry,
+  parse429RetryAfter,
+  resolveTid,
+  splitForLimit,
+  stripAgentSuffix,
+} from './chat-sdk-bridge.js';
 
 function stubAdapter(partial: Partial<Adapter>): Adapter {
   return { name: 'stub', ...partial } as unknown as Adapter;
@@ -33,6 +40,108 @@ describe('splitForLimit', () => {
     expect(chunks.length).toBe(Math.ceil(100 / 30));
     for (const c of chunks) expect(c.length).toBeLessThanOrEqual(30);
     expect(chunks.join('')).toBe(text);
+  });
+});
+
+describe('resolveTid', () => {
+  it('returns threadId when non-empty', () => {
+    expect(resolveTid('thread-abc', 'platform-xyz')).toBe('thread-abc');
+  });
+
+  it('falls back to platformId when threadId is null', () => {
+    expect(resolveTid(null, 'platform-xyz')).toBe('platform-xyz');
+  });
+
+  it('falls back to platformId when threadId is undefined', () => {
+    expect(resolveTid(undefined, 'platform-xyz')).toBe('platform-xyz');
+  });
+
+  it('falls back to platformId when threadId is empty string', () => {
+    // The bug behind `Invalid Discord thread ID: ""` — `??` alone would let
+    // the empty string through.
+    expect(resolveTid('', 'platform-xyz')).toBe('platform-xyz');
+  });
+});
+
+describe('stripAgentSuffix', () => {
+  it('strips :ag_<id> suffix from internal messageIds', () => {
+    expect(stripAgentSuffix('1496835765265760306:ag_b26be4d02e91')).toBe('1496835765265760306');
+  });
+
+  it('returns the input unchanged when no agent suffix is present', () => {
+    expect(stripAgentSuffix('1496835765265760306')).toBe('1496835765265760306');
+  });
+
+  it('only strips the agent suffix, not other colons', () => {
+    expect(stripAgentSuffix('discord:guild:channel')).toBe('discord:guild:channel');
+  });
+});
+
+describe('parse429RetryAfter', () => {
+  it('returns null for non-429 errors', () => {
+    expect(parse429RetryAfter(new Error('NetworkError: ECONNRESET'))).toBeNull();
+  });
+
+  it('extracts retry_after from Discord 429 body', () => {
+    const err = new Error(
+      'Discord API error: 429 {"message": "You are being rate limited.", "retry_after": 0.523, "global": false}',
+    );
+    expect(parse429RetryAfter(err)).toBeCloseTo(0.523);
+  });
+
+  it('returns 1s default when 429 has no parseable retry_after', () => {
+    expect(parse429RetryAfter(new Error('Discord API error: 429 (no body)'))).toBe(1);
+  });
+});
+
+describe('deliverWithDiscord429Retry', () => {
+  it('returns the result on first success without sleeping', async () => {
+    let calls = 0;
+    const result = await deliverWithDiscord429Retry(async () => {
+      calls++;
+      return 'ok';
+    }, 'test');
+    expect(calls).toBe(1);
+    expect(result).toBe('ok');
+  });
+
+  it('retries on a 429, then succeeds', async () => {
+    let calls = 0;
+    const result = await deliverWithDiscord429Retry(async () => {
+      calls++;
+      if (calls === 1) {
+        throw new Error('Discord API error: 429 {"retry_after": 0.01}');
+      }
+      return 'ok';
+    }, 'test');
+    expect(calls).toBe(2);
+    expect(result).toBe('ok');
+  });
+
+  it('rethrows the original error after exhausting attempts', async () => {
+    let calls = 0;
+    await expect(
+      deliverWithDiscord429Retry(
+        async () => {
+          calls++;
+          throw new Error('Discord API error: 429 {"retry_after": 0.01}');
+        },
+        'test',
+        2,
+      ),
+    ).rejects.toThrow(/429/);
+    expect(calls).toBe(2);
+  });
+
+  it('rethrows non-429 errors immediately without retry', async () => {
+    let calls = 0;
+    await expect(
+      deliverWithDiscord429Retry(async () => {
+        calls++;
+        throw new Error('NetworkError: ECONNRESET');
+      }, 'test'),
+    ).rejects.toThrow(/ECONNRESET/);
+    expect(calls).toBe(1);
   });
 });
 

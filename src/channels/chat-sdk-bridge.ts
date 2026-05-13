@@ -75,6 +75,60 @@ export interface ChatSdkBridgeConfig {
 }
 
 /**
+ * Resolve the thread id we should send to the underlying adapter.
+ * Falls back to platformId when threadId is null, undefined, or empty —
+ * `??` alone wouldn't catch the empty-string case, which Discord rejects
+ * with `Invalid Discord thread ID: ""`.
+ */
+export function resolveTid(threadId: string | null | undefined, platformId: string): string {
+  return threadId && threadId.length > 0 ? threadId : platformId;
+}
+
+/**
+ * Internal messageIds are stored as `{platformSnowflake}:{agentGroupSuffix}`
+ * to disambiguate cross-group routing. The platform's REST API only accepts
+ * the bare snowflake, so strip the agent suffix before any addReaction /
+ * editMessage call.
+ */
+export function stripAgentSuffix(messageId: string): string {
+  const idx = messageId.indexOf(':ag_');
+  return idx === -1 ? messageId : messageId.slice(0, idx);
+}
+
+export function parse429RetryAfter(err: unknown): number | null {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (!msg.includes('429')) return null;
+  const match = msg.match(/"retry_after"\s*:\s*([\d.]+)/);
+  if (!match) return 1;
+  const v = parseFloat(match[1]);
+  return Number.isFinite(v) ? v : 1;
+}
+
+/**
+ * Wrap a delivery call so that Discord 429 responses are honored with the
+ * server-supplied retry_after instead of failing the whole approval/message.
+ * @chat-adapter/discord@4.26.0 surfaces 429 to the caller rather than
+ * sleeping internally; see error log 2026-04-29 07:00–07:01 for a 12-burst
+ * that ended in silently-skipped sensitive bash actions.
+ */
+export async function deliverWithDiscord429Retry<T>(fn: () => Promise<T>, label: string, maxAttempts = 3): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const retryAfter = parse429RetryAfter(err);
+      if (retryAfter == null || attempt === maxAttempts) throw err;
+      const sleepMs = Math.round(retryAfter * 1000) + Math.floor(Math.random() * 250);
+      log.warn('Discord 429 — backing off', { label, attempt, sleepMs });
+      await new Promise((resolve) => setTimeout(resolve, sleepMs));
+    }
+  }
+  throw lastErr;
+}
+
+/**
  * Split `text` into chunks no larger than `limit`, preferring paragraph
  * breaks, then line breaks, then a hard character cut as a last resort.
  * Preserves code fences only structurally — a fenced block that straddles a
@@ -109,6 +163,15 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const serialized = message.toJSON() as Record<string, any>;
 
+    // Diagnostic: inbound attachment count, regardless of branch taken below.
+    // Helps determine whether `fileCount=undefined` downstream means the
+    // adapter delivered no attachments vs. the bridge dropped them.
+    log.info('chat-sdk-bridge inbound attachment audit', {
+      attachmentCount: message.attachments?.length ?? 0,
+      hasAttachmentsField: message.attachments !== undefined,
+      attachmentTypes: message.attachments?.map((a) => a.type) ?? [],
+    });
+
     // Download attachment data before serialization loses fetchData()
     if (message.attachments && message.attachments.length > 0) {
       const enriched = [];
@@ -127,7 +190,26 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
             const buffer = await att.fetchData();
             entry.data = buffer.toString('base64');
           } catch (err) {
-            log.warn('Failed to download attachment', { type: att.type, err });
+            log.warn('Failed to download attachment via fetchData', { type: att.type, err });
+          }
+        } else {
+          // Fallback for adapters that only expose a public URL (e.g. Discord CDN,
+          // which requires no auth). chat-sdk's generic Attachment type doesn't
+          // declare `url`, but the Discord adapter populates it on inbound messages.
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const url = (att as any).url as string | undefined;
+          if (url) {
+            try {
+              const res = await fetch(url);
+              if (res.ok) {
+                const buffer = Buffer.from(await res.arrayBuffer());
+                entry.data = buffer.toString('base64');
+              } else {
+                log.warn('Attachment URL fetch returned non-200', { type: att.type, status: res.status });
+              }
+            } catch (err) {
+              log.warn('Failed to download attachment via URL', { type: att.type, err });
+            }
           }
         }
         enriched.push(entry);
@@ -229,7 +311,10 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // getMessagingGroupWithAgentCount (~1 DB read) for unwired channels,
       // so forwarding every one is cheap enough to not need a bridge-side
       // flood gate.
-      chat.onNewMessage(/./, async (thread, message) => {
+      // Pattern is /[\s\S]*/ (not /./) so empty-text messages — attachment-only,
+      // sticker-only, voice-note — also dispatch. /./ requires ≥1 char and silently
+      // drops them before the bridge ever sees them. Verified 2026-05-01.
+      chat.onNewMessage(/[\s\S]*/, async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
         await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, false));
       });
@@ -318,18 +403,27 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     async deliver(platformId: string, threadId: string | null, message): Promise<string | undefined> {
       // platformId is already in the adapter's encoded format (e.g. "telegram:6037840640",
       // "discord:guildId:channelId") — use it directly as the thread ID
-      const tid = threadId ?? platformId;
+      const tid = resolveTid(threadId, platformId);
       const content = message.content as Record<string, unknown>;
 
       if (content.operation === 'edit' && content.messageId) {
-        await adapter.editMessage(tid, content.messageId as string, {
-          markdown: transformText((content.text as string) || (content.markdown as string) || ''),
-        });
+        const platformMsgId = stripAgentSuffix(content.messageId as string);
+        await deliverWithDiscord429Retry(
+          () =>
+            adapter.editMessage(tid, platformMsgId, {
+              markdown: transformText((content.text as string) || (content.markdown as string) || ''),
+            }),
+          'editMessage',
+        );
         return;
       }
 
       if (content.operation === 'reaction' && content.messageId && content.emoji) {
-        await adapter.addReaction(tid, content.messageId as string, content.emoji as string);
+        const platformMsgId = stripAgentSuffix(content.messageId as string);
+        await deliverWithDiscord429Retry(
+          () => adapter.addReaction(tid, platformMsgId, content.emoji as string),
+          'addReaction',
+        );
         return;
       }
 
@@ -354,10 +448,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
             ),
           ],
         });
-        const result = await adapter.postMessage(tid, {
-          card,
-          fallbackText: `${title}\n\n${question}\nOptions: ${options.map((o) => o.label).join(', ')}`,
-        });
+        const result = await deliverWithDiscord429Retry(
+          () =>
+            adapter.postMessage(tid, {
+              card,
+              fallbackText: `${title}\n\n${question}\nOptions: ${options.map((o) => o.label).join(', ')}`,
+            }),
+          'postMessage(ask_question)',
+        );
         return result?.id;
       }
 
@@ -380,9 +478,9 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         for (let i = 0; i < chunks.length; i++) {
           const chunk = chunks[i];
           const attachFiles = i === 0 && fileUploads && fileUploads.length > 0;
-          const result = await adapter.postMessage(
-            tid,
-            attachFiles ? { markdown: chunk, files: fileUploads } : { markdown: chunk },
+          const result = await deliverWithDiscord429Retry(
+            () => adapter.postMessage(tid, attachFiles ? { markdown: chunk, files: fileUploads } : { markdown: chunk }),
+            'postMessage(text)',
           );
           if (i === 0) firstId = result?.id;
         }
@@ -393,13 +491,16 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           data: f.data,
           filename: f.filename,
         }));
-        const result = await adapter.postMessage(tid, { markdown: '', files: fileUploads });
+        const result = await deliverWithDiscord429Retry(
+          () => adapter.postMessage(tid, { markdown: '', files: fileUploads }),
+          'postMessage(files)',
+        );
         return result?.id;
       }
     },
 
     async setTyping(platformId: string, threadId: string | null) {
-      const tid = threadId ?? platformId;
+      const tid = resolveTid(threadId, platformId);
       await adapter.startTyping(tid);
     },
 
