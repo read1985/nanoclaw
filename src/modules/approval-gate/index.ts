@@ -166,6 +166,52 @@ async function tick(): Promise<void> {
         }
 
         dispatched.add(reqId);
+
+        // Preauth shortcut: if the user just clicked a positive option on an
+        // ask_user_question card for this session, consume the .preauth.json
+        // token and auto-approve without surfacing a second Discord card.
+        const preauthPath = path.join(approvalsDir, '.preauth.json');
+        if (fs.existsSync(preauthPath)) {
+          let consumed = false;
+          try {
+            const preauth = JSON.parse(fs.readFileSync(preauthPath, 'utf-8'));
+            const age = Date.now() - new Date(preauth.createdAt).getTime();
+            const ttl = typeof preauth.ttlMs === 'number' ? preauth.ttlMs : 30_000;
+            if (age >= 0 && age < ttl) {
+              const respPath = path.join(approvalsDir, `resp-${reqId}.json`);
+              fs.writeFileSync(
+                respPath,
+                JSON.stringify({
+                  reqId,
+                  approved: true,
+                  decidedBy: 'preauth',
+                  decidedAt: new Date().toISOString(),
+                }),
+              );
+              log.info('Approval-gate: auto-approved via preauth token', {
+                reqId,
+                reason: req.reason,
+                sessionId,
+                ageMs: age,
+                selectedValue: preauth.selectedValue,
+              });
+              consumed = true;
+            } else {
+              log.info('Approval-gate: discarded stale preauth token', { sessionId, ageMs: age });
+            }
+          } catch (err) {
+            log.error('Approval-gate: failed to read preauth token', { err, preauthPath });
+          }
+          // Always remove the token after a fire so a single click can't pre-approve
+          // multiple tool calls.
+          try {
+            fs.unlinkSync(preauthPath);
+          } catch {
+            /* ignore — already gone */
+          }
+          if (consumed) continue;
+        }
+
         try {
           const preview = req.preview.slice(0, 1500);
           await requestApproval({

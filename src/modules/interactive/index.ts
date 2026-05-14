@@ -10,12 +10,50 @@
  * inline in core — it's 15 lines guarded by `hasTable('pending_questions')`,
  * modularizing it adds more registry surface than it saves.
  */
+import fs from 'fs';
+import path from 'path';
+
 import { getDb, hasTable } from '../../db/connection.js';
 import { deletePendingQuestion, getPendingQuestion, getSession } from '../../db/sessions.js';
 import { wakeContainer } from '../../container-runner.js';
 import { registerResponseHandler, type ResponsePayload } from '../../response-registry.js';
 import { log } from '../../log.js';
-import { writeSessionMessage } from '../../session-manager.js';
+import { sessionsBaseDir, writeSessionMessage } from '../../session-manager.js';
+
+// ── Preauth-token bridge to approval-gate ──
+// A positive option click on an ask_user_question card writes a single-use
+// `.preauth.json` token into the same session's approvals IPC dir. The
+// approval-gate watcher consumes it (within PREAUTH_TTL_MS) to skip the
+// per-tool-call Discord card — so the user isn't asked twice for the same
+// logical action (e.g. ask_user_question "Send reply?" then gmail.py reply).
+const PREAUTH_POSITIVE_RE = /^(send|confirm|approve|yes|ok(?:ay)?|go|proceed|do it|sure|looks good)\b/i;
+const PREAUTH_TTL_MS = 30_000;
+
+function maybeWritePreauth(
+  agentGroupId: string,
+  sessionId: string,
+  value: string | undefined,
+  questionId: string,
+): void {
+  const v = (value ?? '').trim();
+  if (!v || !PREAUTH_POSITIVE_RE.test(v)) return;
+  const dir = path.join(sessionsBaseDir(), agentGroupId, sessionId, 'ipc', 'approvals');
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, '.preauth.json'),
+      JSON.stringify({
+        createdAt: new Date().toISOString(),
+        ttlMs: PREAUTH_TTL_MS,
+        questionId,
+        selectedValue: v,
+      }),
+    );
+    log.info('Preauth token written', { agentGroupId, sessionId, questionId, value: v });
+  } catch (err) {
+    log.error('Failed to write preauth token', { err, agentGroupId, sessionId });
+  }
+}
 
 async function handleInteractiveResponse(payload: ResponsePayload): Promise<boolean> {
   if (!hasTable(getDb(), 'pending_questions')) return false;
@@ -51,6 +89,8 @@ async function handleInteractiveResponse(payload: ResponsePayload): Promise<bool
     selectedOption: payload.value,
     sessionId: session.id,
   });
+
+  maybeWritePreauth(session.agent_group_id, session.id, payload.value, payload.questionId);
 
   await wakeContainer(session);
   return true;
