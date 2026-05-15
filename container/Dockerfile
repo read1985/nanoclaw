@@ -53,6 +53,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         tini \
         unzip \
         python3 \
+        mosquitto-clients \
+        imagemagick \
     && if [ "$INSTALL_CJK_FONTS" = "true" ]; then \
         apt-get install -y --no-install-recommends fonts-noto-cjk; \
        fi \

@@ -325,6 +325,15 @@ function buildMounts(
     mounts.push({ hostPath: globalDir, containerPath: '/workspace/global-rw', readonly: false });
   }
 
+  // Kitchen display image dir — RW so kitchen_display.py can write current.jpg
+  // (rendered by headless chromium in-container). Caddy on the host serves it
+  // at https://read-kitchen.duckdns.org/<token>/current.jpg; the token subdir
+  // is sticky+world-writable (1777) so container UID/GID doesn't matter.
+  const kitchenDisplayDir = '/var/lib/kitchen-display';
+  if (fs.existsSync(kitchenDisplayDir)) {
+    mounts.push({ hostPath: kitchenDisplayDir, containerPath: kitchenDisplayDir, readonly: false });
+  }
+
   // Shared CLAUDE.md — read-only, imported by the composed entry point via
   // the `.claude-shared.md` symlink inside the group dir.
   const sharedClaudeMd = path.join(process.cwd(), 'container', 'CLAUDE.md');
